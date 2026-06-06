@@ -8,7 +8,31 @@ export type OllamaModel = {
     family?: string;
     parameter_size?: string;
     quantization_level?: string;
+    context_length?: number;
+    embedding_length?: number;
   };
+  capabilities?: string[];
+};
+
+export type ChatRequest = {
+  run_id?: string;
+  model: string;
+  prompt: string;
+  system_prompt: string;
+  options: GenerateSettings;
+  think?: boolean;
+};
+
+export type ModelMetadata = {
+  name: string;
+  supports_thinking: boolean;
+  context_length?: number;
+  parameter_size?: string;
+  quantization_level?: string;
+  family?: string;
+  architecture?: string;
+  basename?: string;
+  organization?: string;
 };
 
 export type RunningModel = {
@@ -24,6 +48,8 @@ export type LabStatus = {
   service_active: boolean;
   service_state: string;
   gpu_hint: string;
+  ollama_installed: boolean;
+  ollama_version?: string;
 };
 
 export type GenerateSettings = {
@@ -40,6 +66,7 @@ export type RunResult = {
   model: string;
   prompt: string;
   response: string;
+  thinking?: string;
   total_duration?: number;
   eval_count?: number;
   eval_duration?: number;
@@ -61,4 +88,3 @@ export type PullProgress = {
 };
 
 export type ActiveTab = "chat" | "compare" | "bench" | "history";
-

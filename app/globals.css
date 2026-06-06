@@ -70,3 +70,40 @@ select {
 pre {
   font-family: inherit;
 }
+
+@keyframes blink {
+  0%, 50% {
+    opacity: 1;
+  }
+  51%, 100% {
+    opacity: 0;
+  }
+}
+
+.streaming-content {
+  position: relative;
+}
+
+.streaming-content::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(99, 102, 241, 0.03) 50%,
+    transparent 100%
+  );
+  animation: shimmer 2s ease-in-out infinite;
+  pointer-events: none;
+  border-radius: 8px;
+}
+
+@keyframes shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}

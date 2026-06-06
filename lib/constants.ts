@@ -5,7 +5,7 @@ export const DEFAULT_SETTINGS: GenerateSettings = {
   top_p: 0.9,
   top_k: 40,
   repeat_penalty: 1.1,
-  seed: 0,
+  seed: -1,
   num_ctx: 4096,
   num_predict: 512
 };
@@ -27,4 +27,3 @@ export const DEFAULT_PRESETS: Preset[] = [
     prompt: "Summarize the following text into five practical bullets:\n\n"
   }
 ];
-

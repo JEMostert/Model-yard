@@ -32,6 +32,6 @@ export function formatError(error: unknown) {
   return String(error);
 }
 
-function isTauriRuntime() {
+export function isTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }

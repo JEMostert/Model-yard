@@ -47,7 +47,7 @@ export function Inspector(props: Props) {
         <Setting label="Top P" value={props.settings.top_p} min={0} max={1} step={0.05} onChange={(top_p) => props.onSettingsChange({ ...props.settings, top_p })} />
         <Setting label="Top K" value={props.settings.top_k} min={1} max={200} step={1} onChange={(top_k) => props.onSettingsChange({ ...props.settings, top_k })} />
         <Setting label="Repeat" value={props.settings.repeat_penalty} min={0.8} max={2} step={0.05} onChange={(repeat_penalty) => props.onSettingsChange({ ...props.settings, repeat_penalty })} />
-        <Setting label="Seed" value={props.settings.seed} min={0} max={999999} step={1} onChange={(seed) => props.onSettingsChange({ ...props.settings, seed })} />
+        <Setting label="Seed" value={props.settings.seed} min={-1} max={999999} step={1} onChange={(seed) => props.onSettingsChange({ ...props.settings, seed })} />
         <Setting label="Context" value={props.settings.num_ctx} min={512} max={32768} step={512} onChange={(num_ctx) => props.onSettingsChange({ ...props.settings, num_ctx })} />
         <Setting label="Max tokens" value={props.settings.num_predict} min={32} max={4096} step={32} onChange={(num_predict) => props.onSettingsChange({ ...props.settings, num_predict })} />
       </Panel>
@@ -82,4 +82,3 @@ function Setting({ label, value, min, max, step, onChange }: { label: string; va
     </label>
   );
 }
-

@@ -13,6 +13,8 @@ Local-first desktop workbench for testing, comparing, benchmarking, and managing
 
 When building UI, use existing shadcn-style components as much as possible when appropriate, and compose layout/styling with Tailwind utilities.
 
+When a requested implementation can be handled at a deeper or more correct product/architecture level, push back briefly before implementing the shallow version. Prefer the real capability over a visual approximation when the stack supports it.
+
 For fast validation, prefer:
 
 ```bash
