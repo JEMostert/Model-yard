@@ -35,13 +35,34 @@ import type {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { Slider } from "@/components/ui/slider";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 
 const tabs: ActiveTab[] = ["chat", "compare", "bench", "history"];
+const tabStyles: Record<ActiveTab, { active: string; glow: string }> = {
+  chat: {
+    active: "bg-cyan-400 text-slate-950 shadow-cyan-950/40",
+    glow: "shadow-[inset_0_1px_0_rgba(255,255,255,0.55),0_1px_0_rgba(255,255,255,0.18),0_7px_14px_rgba(34,211,238,0.24)]",
+  },
+  compare: {
+    active: "bg-emerald-400 text-slate-950 shadow-emerald-950/40",
+    glow: "shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_1px_0_rgba(255,255,255,0.16),0_7px_14px_rgba(52,211,153,0.22)]",
+  },
+  bench: {
+    active: "bg-amber-400 text-slate-950 shadow-amber-950/40",
+    glow: "shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_1px_0_rgba(255,255,255,0.16),0_7px_14px_rgba(251,191,36,0.22)]",
+  },
+  history: {
+    active: "bg-violet-400 text-slate-950 shadow-violet-950/40",
+    glow: "shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_1px_0_rgba(255,255,255,0.16),0_7px_14px_rgba(167,139,250,0.22)]",
+  },
+};
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState<ActiveTab>("chat");
@@ -270,7 +291,7 @@ export default function Home() {
           <div className="flex h-[52px] shrink-0 items-center border-b border-border bg-card px-5 text-[13px] font-semibold leading-none text-foreground">
             <span>model-yard</span>
           </div>
-          <ScrollArea className="min-h-0 flex-1" type="auto">
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
             <CardContent className="flex flex-col gap-4 p-3">
               <div className="flex h-8 items-center gap-2 rounded-lg border border-border bg-background px-2.5 text-[11px] text-muted-foreground">
                 <Search className="size-3.5" />
@@ -327,7 +348,7 @@ export default function Home() {
                 )}
               </NavSection>
             </CardContent>
-          </ScrollArea>
+          </div>
         </Card>
       </aside>
 
@@ -338,7 +359,7 @@ export default function Home() {
           </div>
         )}
 
-        <ScrollArea className="min-h-0 flex-1" type="auto">
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
           <div className="mx-auto w-full max-w-[760px] px-[22px] pb-8 pt-[22px]">
             {activeTab === "compare" && (
               <div className="flex flex-wrap gap-1.5 pb-[18px]">
@@ -369,7 +390,7 @@ export default function Home() {
               <ChatThread results={visibleResults} activeTab={activeTab} />
             )}
           </div>
-        </ScrollArea>
+        </div>
 
         <footer className="shrink-0 border-border">
           <ChatInput
@@ -405,7 +426,7 @@ export default function Home() {
           <div className="flex h-[52px] shrink-0 items-center justify-between border-b border-border bg-card px-5 text-[13px] font-semibold leading-none text-foreground">
             <span>Configuration</span>
           </div>
-          <ScrollArea className="min-h-0 flex-1">
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
             <CardContent className="space-y-5 p-4">
               <InspectorSection title="System Prompt">
                 <Textarea
@@ -543,7 +564,7 @@ export default function Home() {
                 </Button>
               </div>
             </CardContent>
-          </ScrollArea>
+          </div>
         </Card>
       </aside>
 
@@ -556,38 +577,43 @@ export default function Home() {
           <Settings className="size-3.5" />
           <span>Settings</span>
         </Button>
-        <div className="flex items-center gap-1 justify-self-center">
-          {tabs.map((tab) => (
-            <button
-              key={tab}
-              className={cn(
-                "flex h-7 items-center rounded-md px-3.5 text-xs font-medium capitalize text-muted-foreground transition-colors hover:bg-accent hover:text-foreground",
-                activeTab === tab &&
-                  "bg-primary text-primary-foreground hover:bg-primary hover:text-primary-foreground",
-              )}
-              onClick={() => setActiveTab(tab)}
-            >
-              {tab}
-            </button>
-          ))}
+        <div className="justify-self-center rounded-lg border border-black/30 bg-black/25 p-1 shadow-[inset_0_1px_3px_rgba(0,0,0,0.75),inset_0_-1px_0_rgba(255,255,255,0.06)]">
+          <div className="flex items-center gap-0.5">
+            {tabs.map((tab) => {
+              const isActive = activeTab === tab;
+              return (
+                <button
+                  key={tab}
+                  className={cn(
+                    "relative flex h-6 items-center rounded-md px-3 text-[11px] font-semibold capitalize transition-all duration-150",
+                    "text-muted-foreground hover:bg-white/5 hover:text-foreground",
+                    "active:translate-y-px",
+                    isActive &&
+                      cn(
+                        "translate-y-[-1px]",
+                        tabStyles[tab].active,
+                        tabStyles[tab].glow,
+                      ),
+                  )}
+                  onClick={() => setActiveTab(tab)}
+                >
+                  <span
+                    className={cn(
+                      "mr-1.5 size-1.5 rounded-full",
+                      tab === "chat" && "bg-cyan-400",
+                      tab === "compare" && "bg-emerald-400",
+                      tab === "bench" && "bg-amber-400",
+                      tab === "history" && "bg-violet-400",
+                      isActive && "bg-slate-950/80",
+                    )}
+                  />
+                  {tab}
+                </button>
+              );
+            })}
+          </div>
         </div>
         <div className="flex items-center gap-1 justify-self-end">
-          <Button
-            variant="ghost"
-            size="icon"
-            className={cn(
-              "size-7 rounded-md text-muted-foreground hover:bg-accent hover:text-foreground",
-              configOpen && "bg-accent text-foreground",
-            )}
-            onClick={() => setConfigOpen((open) => !open)}
-            title={configOpen ? "Hide configuration" : "Show configuration"}
-          >
-            {configOpen ? (
-              <PanelRightClose className="size-3.5" />
-            ) : (
-              <PanelRightOpen className="size-3.5" />
-            )}
-          </Button>
           <Popover open={statusOpen} onOpenChange={setStatusOpen}>
             <PopoverTrigger asChild>
               <Button
@@ -628,6 +654,22 @@ export default function Home() {
               </div>
             </PopoverContent>
           </Popover>
+          <Button
+            variant="ghost"
+            size="icon"
+            className={cn(
+              "size-7 rounded-md text-muted-foreground hover:bg-accent hover:text-foreground",
+              configOpen && "bg-accent text-foreground",
+            )}
+            onClick={() => setConfigOpen((open) => !open)}
+            title={configOpen ? "Hide configuration" : "Show configuration"}
+          >
+            {configOpen ? (
+              <PanelRightClose className="size-3.5" />
+            ) : (
+              <PanelRightOpen className="size-3.5" />
+            )}
+          </Button>
         </div>
       </Card>
     </main>
