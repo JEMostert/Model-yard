@@ -1,5 +1,6 @@
 use chrono::Utc;
 use futures_util::StreamExt;
+use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -9,6 +10,7 @@ use tauri::{Emitter, Manager};
 use tokio::process::Command;
 
 const OLLAMA_URL: &str = "http://localhost:11434";
+const OLLAMA_LIBRARY_URL: &str = "https://ollama.com";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ModelDetails {
@@ -106,6 +108,29 @@ struct ModelMetadata {
 }
 
 #[derive(Debug, Serialize)]
+struct CatalogModel {
+    name: String,
+    description: Option<String>,
+    pulls: Option<String>,
+    tag_count: Option<String>,
+    updated: Option<String>,
+    capabilities: Vec<String>,
+    sizes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogTag {
+    name: String,
+    size: Option<String>,
+    context: Option<String>,
+    input: Option<String>,
+    digest: Option<String>,
+    updated: Option<String>,
+    quant: Option<String>,
+    variant: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct RunResult {
     model: String,
     prompt: String,
@@ -184,12 +209,18 @@ fn process_chat_stream_line(
     Ok(())
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct PullProgress {
     status: String,
     digest: Option<String>,
     total: Option<u64>,
     completed: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct PullProgressEvent {
+    model: String,
+    progress: PullProgress,
 }
 
 async fn command_output(program: &str, args: &[&str]) -> Option<String> {
@@ -257,6 +288,179 @@ fn supports_thinking(show: &ShowResponse) -> bool {
                 || lower.contains("reasoning_content")
                 || lower.contains("<think>")
         })
+}
+
+fn strip_html(value: &str) -> String {
+    let tag_re = Regex::new(r"(?s)<[^>]+>").expect("valid regex");
+    decode_html_entities(tag_re.replace_all(value, " ").as_ref())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn decode_html_entities(value: &str) -> String {
+    value
+        .replace("&#39;", "'")
+        .replace("&quot;", "\"")
+        .replace("&amp;", "&")
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+fn encode_query(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
+            b' ' => vec!['+'],
+            _ => format!("%{byte:02X}").chars().collect(),
+        })
+        .collect()
+}
+
+fn captures_text(block: &str, pattern: &str) -> Option<String> {
+    Regex::new(pattern)
+        .ok()?
+        .captures(block)
+        .and_then(|captures| captures.get(1))
+        .map(|match_| strip_html(match_.as_str()))
+        .filter(|value| !value.is_empty())
+}
+
+fn captures_many(block: &str, pattern: &str) -> Vec<String> {
+    let Ok(regex) = Regex::new(pattern) else {
+        return Vec::new();
+    };
+    regex
+        .captures_iter(block)
+        .filter_map(|captures| captures.get(1))
+        .map(|match_| strip_html(match_.as_str()))
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn infer_quant(name: &str) -> Option<String> {
+    let tag = name.split(':').nth(1)?;
+    let lower = tag.to_lowercase();
+    for marker in [
+        "q2_k", "q3_k_s", "q3_k_m", "q3_k_l", "q4_0", "q4_1", "q4_k_s", "q4_k_m",
+        "q5_0", "q5_1", "q5_k_s", "q5_k_m", "q6_k", "q8_0", "fp16", "f16",
+    ] {
+        if lower.contains(marker) {
+            return Some(marker.to_uppercase());
+        }
+    }
+    None
+}
+
+fn infer_variant(name: &str) -> Option<String> {
+    let tag = name.split(':').nth(1)?;
+    let cleaned = tag
+        .replace("-instruct", "")
+        .replace("-text", "")
+        .replace("-q2_K", "")
+        .replace("-q3_K_S", "")
+        .replace("-q3_K_M", "")
+        .replace("-q3_K_L", "")
+        .replace("-q4_0", "")
+        .replace("-q4_1", "")
+        .replace("-q4_K_S", "")
+        .replace("-q4_K_M", "")
+        .replace("-q5_0", "")
+        .replace("-q5_1", "")
+        .replace("-q5_K_S", "")
+        .replace("-q5_K_M", "")
+        .replace("-q6_K", "")
+        .replace("-q8_0", "")
+        .replace("-fp16", "");
+    if cleaned.is_empty() || cleaned == "latest" {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn parse_catalog_search(html: &str) -> Vec<CatalogModel> {
+    let block_re = Regex::new(r#"(?s)<li x-test-model.*?</li>"#).expect("valid regex");
+    let href_re = Regex::new(r#"href="/library/([^":]+)""#).expect("valid regex");
+
+    block_re
+        .find_iter(html)
+        .filter_map(|block_match| {
+            let block = block_match.as_str();
+            let name = href_re
+                .captures(block)
+                .and_then(|captures| captures.get(1))
+                .map(|match_| decode_html_entities(match_.as_str()))?;
+            Some(CatalogModel {
+                name,
+                description: captures_text(block, r#"(?s)<p class="max-w-lg[^"]*">(.*?)</p>"#),
+                pulls: captures_text(block, r#"(?s)<span x-test-pull-count>(.*?)</span>"#),
+                tag_count: captures_text(block, r#"(?s)<span x-test-tag-count>(.*?)</span>"#),
+                updated: captures_text(block, r#"(?s)<span x-test-updated>(.*?)</span>"#),
+                capabilities: captures_many(block, r#"(?s)<span x-test-capability[^>]*>(.*?)</span>"#),
+                sizes: captures_many(block, r#"(?s)<span x-test-size[^>]*>(.*?)</span>"#),
+            })
+        })
+        .collect()
+}
+
+fn parse_catalog_tags(html: &str) -> Vec<CatalogTag> {
+    let mobile_re =
+        Regex::new(r#"(?s)<a href="/library/([^"]+)" class="md:hidden.*?</a>"#).expect("valid regex");
+    let name_re = Regex::new(r#"/library/([^"]+)""#).expect("valid regex");
+    let digest_re = Regex::new(r#">([a-f0-9]{12})</span>"#).expect("valid regex");
+    let size_context_re =
+        Regex::new(r#"•\s*([^•<]+?)\s*•\s*([^•<]+?)\s+context window"#).expect("valid regex");
+    let input_re = Regex::new(r#"context window\s*•\s*([^•<]+?)\s+input"#).expect("valid regex");
+    let updated_re = Regex::new(r#"input\s*•\s*([^<]+?)\s*<"#).expect("valid regex");
+
+    let mut tags = Vec::new();
+    for block_match in mobile_re.find_iter(html) {
+        let block = block_match.as_str();
+        let Some(name) = name_re
+            .captures(block)
+            .and_then(|captures| captures.get(1))
+            .map(|match_| decode_html_entities(match_.as_str()))
+        else {
+            continue;
+        };
+        if tags.iter().any(|tag: &CatalogTag| tag.name == name) {
+            continue;
+        }
+
+        let size_context = size_context_re.captures(block);
+        tags.push(CatalogTag {
+            quant: infer_quant(&name),
+            variant: infer_variant(&name),
+            name,
+            size: size_context
+                .as_ref()
+                .and_then(|captures| captures.get(1))
+                .map(|match_| strip_html(match_.as_str())),
+            context: size_context
+                .as_ref()
+                .and_then(|captures| captures.get(2))
+                .map(|match_| strip_html(match_.as_str())),
+            input: input_re
+                .captures(block)
+                .and_then(|captures| captures.get(1))
+                .map(|match_| strip_html(match_.as_str())),
+            digest: digest_re
+                .captures(block)
+                .and_then(|captures| captures.get(1))
+                .map(|match_| match_.as_str().to_string()),
+            updated: updated_re
+                .captures(block)
+                .and_then(|captures| captures.get(1))
+                .map(|match_| strip_html(match_.as_str())),
+        });
+    }
+
+    tags
 }
 
 #[tauri::command]
@@ -436,8 +640,132 @@ async fn running_models() -> Result<Vec<RunningModel>, String> {
     Ok(ps.models)
 }
 
+fn running_model_identifier(model: &RunningModel) -> &str {
+    model.model.as_deref().unwrap_or(&model.name)
+}
+
+fn other_running_model_names<'a>(
+    models: &'a [RunningModel],
+    target: &str,
+) -> Vec<&'a str> {
+    models
+        .iter()
+        .map(running_model_identifier)
+        .filter(|name| *name != target)
+        .collect()
+}
+
+fn unload_model_payload(name: &str) -> Value {
+    json!({ "model": name, "prompt": "", "stream": false, "keep_alive": 0 })
+}
+
+fn load_model_payload(name: &str) -> Value {
+    json!({ "model": name, "prompt": "", "stream": false, "keep_alive": "-1" })
+}
+
+async fn unload_model_inner(name: &str) -> Result<(), String> {
+    let response = client()
+        .post(format!("{OLLAMA_URL}/api/generate"))
+        .json(&unload_model_payload(name))
+        .send()
+        .await
+        .map_err(|error| format!("Unload request failed: {error}"))?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(format!("Ollama returned {status}: {body}"))
+    }
+}
+
+async fn unload_other_models(target: &str) -> Result<(), String> {
+    let models = running_models().await?;
+    for name in other_running_model_names(&models, target) {
+        unload_model_inner(name).await?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn unload_model(name: String) -> Result<Vec<RunningModel>, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return running_models().await;
+    }
+    unload_model_inner(name).await?;
+    running_models().await
+}
+
+#[tauri::command]
+async fn load_model(name: String) -> Result<Vec<RunningModel>, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return running_models().await;
+    }
+    unload_other_models(name).await?;
+
+    let response = client()
+        .post(format!("{OLLAMA_URL}/api/generate"))
+        .json(&load_model_payload(name))
+        .send()
+        .await
+        .map_err(|error| format!("Load request failed: {error}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Ollama returned {status}: {body}"));
+    }
+
+    running_models().await
+}
+
+#[tauri::command]
+async fn search_catalog(query: String) -> Result<Vec<CatalogModel>, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let response = client()
+        .get(format!("{OLLAMA_LIBRARY_URL}/search?q={}", encode_query(query)))
+        .send()
+        .await
+        .map_err(|error| format!("Could not search Ollama catalog: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("Ollama catalog returned {}", response.status()));
+    }
+
+    let html = response.text().await.map_err(|error| error.to_string())?;
+    Ok(parse_catalog_search(&html))
+}
+
+#[tauri::command]
+async fn catalog_model_tags(model: String) -> Result<Vec<CatalogTag>, String> {
+    let model = model.trim().trim_start_matches("library/").trim_matches('/');
+    if model.is_empty() || model.contains(':') {
+        return Ok(Vec::new());
+    }
+
+    let response = client()
+        .get(format!("{OLLAMA_LIBRARY_URL}/library/{model}/tags"))
+        .send()
+        .await
+        .map_err(|error| format!("Could not load Ollama tags: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("Ollama catalog returned {}", response.status()));
+    }
+
+    let html = response.text().await.map_err(|error| error.to_string())?;
+    Ok(parse_catalog_tags(&html))
+}
+
 #[tauri::command]
 async fn chat_model(app: tauri::AppHandle, request: ChatRequest) -> Result<RunResult, String> {
+    unload_other_models(&request.model).await?;
+
     let mut messages = Vec::new();
     if !request.system_prompt.trim().is_empty() {
         messages.push(json!({ "role": "system", "content": request.system_prompt }));
@@ -541,7 +869,7 @@ async fn chat_model(app: tauri::AppHandle, request: ChatRequest) -> Result<RunRe
 }
 
 #[tauri::command]
-async fn pull_model(name: String) -> Result<Vec<PullProgress>, String> {
+async fn pull_model(app: tauri::AppHandle, name: String) -> Result<Vec<PullProgress>, String> {
     let response = client()
         .post(format!("{OLLAMA_URL}/api/pull"))
         .json(&json!({ "name": name, "stream": true }))
@@ -569,6 +897,13 @@ async fn pull_model(name: String) -> Result<Vec<PullProgress>, String> {
                 continue;
             }
             if let Ok(item) = serde_json::from_str::<PullProgress>(trimmed) {
+                let _ = app.emit(
+                    "pull-progress",
+                    PullProgressEvent {
+                        model: name.clone(),
+                        progress: item.clone(),
+                    },
+                );
                 progress.push(item);
             }
         }
@@ -608,6 +943,10 @@ pub fn run() {
             model_metadata,
             list_models,
             running_models,
+            load_model,
+            unload_model,
+            search_catalog,
+            catalog_model_tags,
             chat_model,
             pull_model,
             install_ollama,
@@ -615,4 +954,84 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn running(name: &str, model: Option<&str>) -> RunningModel {
+        RunningModel {
+            name: name.to_string(),
+            model: model.map(str::to_string),
+            size: None,
+            size_vram: None,
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn unload_payload_uses_keep_alive_zero() {
+        assert_eq!(
+            unload_model_payload("llama3.2:latest"),
+            json!({
+                "model": "llama3.2:latest",
+                "prompt": "",
+                "stream": false,
+                "keep_alive": 0
+            })
+        );
+    }
+
+    #[test]
+    fn load_payload_keeps_model_loaded_indefinitely() {
+        assert_eq!(
+            load_model_payload("llama3.2:latest"),
+            json!({
+                "model": "llama3.2:latest",
+                "prompt": "",
+                "stream": false,
+                "keep_alive": "-1"
+            })
+        );
+    }
+
+    #[test]
+    fn running_model_identifier_prefers_model_field() {
+        let item = running("display-name", Some("actual-model:latest"));
+        assert_eq!(running_model_identifier(&item), "actual-model:latest");
+    }
+
+    #[test]
+    fn running_model_identifier_falls_back_to_name() {
+        let item = running("actual-model:latest", None);
+        assert_eq!(running_model_identifier(&item), "actual-model:latest");
+    }
+
+    #[test]
+    fn other_running_model_names_excludes_target_model() {
+        let models = vec![
+            running("llama3.2:latest", None),
+            running("display-minicpm", Some("minicpm5:latest")),
+            running("qwen2.5:latest", None),
+        ];
+
+        assert_eq!(
+            other_running_model_names(&models, "minicpm5:latest"),
+            vec!["llama3.2:latest", "qwen2.5:latest"]
+        );
+    }
+
+    #[test]
+    fn other_running_model_names_keeps_all_when_target_absent() {
+        let models = vec![
+            running("llama3.2:latest", None),
+            running("qwen2.5:latest", None),
+        ];
+
+        assert_eq!(
+            other_running_model_names(&models, "minicpm5:latest"),
+            vec!["llama3.2:latest", "qwen2.5:latest"]
+        );
+    }
 }

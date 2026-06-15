@@ -4,6 +4,7 @@ import {
   Check,
   ChevronDown,
   Cpu,
+  PowerOff,
   RefreshCw,
   Search,
 } from "lucide-react";
@@ -31,8 +32,10 @@ type ChatInputProps = {
   busy: string;
   thinkingEnabled: boolean;
   thinkingSupported: boolean;
+  selectedModelLoaded: boolean;
   onSelectModel: (value: string) => void;
   onThinkingChange: (value: boolean) => void;
+  onEjectSelectedModel: () => void;
   onRefresh: () => void;
   onRun: () => void;
 };
@@ -46,8 +49,10 @@ export function ChatInput({
   busy,
   thinkingEnabled,
   thinkingSupported,
+  selectedModelLoaded,
   onSelectModel,
   onThinkingChange,
+  onEjectSelectedModel,
   onRefresh,
   onRun,
 }: ChatInputProps) {
@@ -166,11 +171,24 @@ export function ChatInput({
               <Switch checked={thinkingEnabled} onCheckedChange={onThinkingChange} />
             </label>
           )}
+          {selectedModelLoaded && (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-7 rounded-md border-0 bg-transparent text-muted-foreground hover:bg-destructive/15 hover:text-destructive"
+              onClick={onEjectSelectedModel}
+              disabled={Boolean(busy)}
+              title="Eject loaded model"
+            >
+              <PowerOff className="size-3.5" />
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="icon"
             className="size-7 rounded-md border-0 bg-transparent text-muted-foreground hover:bg-accent hover:text-foreground"
             onClick={onRefresh}
+            title="Refresh models"
           >
             <RefreshCw className="size-3.5" />
           </Button>
@@ -180,6 +198,7 @@ export function ChatInput({
           className="size-8 rounded-full bg-primary text-primary-foreground shadow-md shadow-black/30 hover:bg-primary/90"
           onClick={onRun}
           disabled={!canRun}
+          title="Send prompt"
         >
           <ArrowUp className="size-3.5" />
         </Button>

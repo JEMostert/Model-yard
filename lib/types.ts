@@ -52,6 +52,27 @@ export type LabStatus = {
   ollama_version?: string;
 };
 
+export type CatalogModel = {
+  name: string;
+  description?: string;
+  pulls?: string;
+  tag_count?: string;
+  updated?: string;
+  capabilities: string[];
+  sizes: string[];
+};
+
+export type CatalogTag = {
+  name: string;
+  size?: string;
+  context?: string;
+  input?: string;
+  digest?: string;
+  updated?: string;
+  quant?: string;
+  variant?: string;
+};
+
 export type GenerateSettings = {
   temperature: number;
   top_p: number;
