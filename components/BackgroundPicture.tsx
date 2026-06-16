@@ -27,6 +27,8 @@ export function BackgroundPicture({
         alt={alt}
         width={image.width}
         height={image.height}
+        decoding="async"
+        fetchPriority="low"
         className={cn("h-full w-full object-cover", className)}
         draggable={false}
       />

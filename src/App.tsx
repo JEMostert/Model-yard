@@ -1,36 +1,24 @@
 "use client";
 
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   Activity,
-  ArrowDownToLine,
-  Check,
-  ChevronRight,
   Circle,
-  Clock,
   Cpu,
-  Database,
-  HardDrive,
-  MessageSquare,
-  Package,
+  Download,
   PanelRightClose,
   PanelRightOpen,
-  Search,
-  Settings,
   ShieldCheck,
-  Sparkles,
-  Star,
 } from "lucide-react";
 import { DEFAULT_PRESETS, DEFAULT_SETTINGS } from "@/lib/constants";
-import { formatBytes } from "@/lib/format";
 import { midnightGardenBackground } from "@/lib/static-backgrounds";
 import { storage } from "@/lib/storage";
+import { buildChatMessages } from "@/lib/chat";
 import { call, formatError, isTauriRuntime } from "@/lib/tauri";
 import { BackgroundPicture } from "@/components/BackgroundPicture";
 import { ChatInput } from "@/components/ChatInput";
 import type {
-  ActiveTab,
   CatalogModel,
   CatalogTag,
   ChatRequest,
@@ -40,6 +28,7 @@ import type {
   OllamaModel,
   Preset,
   PullProgress,
+  ReasoningMode,
   RunningModel,
   RunResult,
 } from "@/lib/types";
@@ -62,8 +51,6 @@ import {
 import {
   calculatePullOverall,
   normalizeSettings,
-  tabStyles,
-  tabs,
   type SettingsSectionId,
   type StylingPresetId,
   type WorkspaceMode,
@@ -87,13 +74,9 @@ const ChatThread = lazy(() =>
   })),
 );
 
-const BenchTable = lazy(() =>
-  import("@/src/model-yard/chat-thread").then((module) => ({
-    default: module.BenchTable,
-  })),
-);
-
 const SETTINGS_SEED_MIGRATION_KEY = "model-yard-seed-negative-one-migrated";
+const EMPTY_REASONING_MODES: ReasoningMode[] = [];
+const backgroundImageEnabled = import.meta.env.VITE_BACKGROUND_IMAGE !== "false";
 type ChatTokenPayload = {
   run_id: string;
   content: string;
@@ -106,26 +89,58 @@ type PullProgressPayload = {
   model: string;
   progress: PullProgress;
 };
+const MAX_PULL_PROGRESS_ITEMS = 80;
+
+function pullProgressKey(progress: PullProgress) {
+  return progress.digest ?? progress.status;
+}
+
+function compactPullProgress(current: PullProgress[], next: PullProgress) {
+  const nextKey = pullProgressKey(next);
+  const deduped = current.filter((item) => pullProgressKey(item) !== nextKey);
+  return [...deduped, next].slice(-MAX_PULL_PROGRESS_ITEMS);
+}
+
+function compactPullProgressList(progress: PullProgress[]) {
+  return progress.reduce<PullProgress[]>(compactPullProgress, []);
+}
+
+function LlamaIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+    >
+      <path d="M8 3c-1 0-2 1-2 2v2c-2 0-3 1-3 3 0 2 1 3 3 4v3a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2v-3c2-1 3-2 3-4 0-2-1-3-3-3V5c0-1-1-2-2-2" />
+      <circle cx="9" cy="10" r="1" fill="currentColor" />
+      <circle cx="15" cy="10" r="1" fill="currentColor" />
+      <path d="M10 14h4" />
+      <path d="M8 3c0-1 1-1 1-1" />
+      <path d="M16 3c0-1-1-1-1-1" />
+    </svg>
+  );
+}
 
 export default function Home() {
   const [workspace, setWorkspace] = useState<WorkspaceMode>("lab");
   const [activeSettingsSection, setActiveSettingsSection] =
     useState<SettingsSectionId>("styling");
-  const [activeTab, setActiveTab] = useState<ActiveTab>("chat");
   const [status, setStatus] = useState<LabStatus | null>(null);
   const [models, setModels] = useState<OllamaModel[]>([]);
   const [modelMetadata, setModelMetadata] = useState<Record<string, ModelMetadata>>({});
   const [running, setRunning] = useState<RunningModel[]>([]);
   const [selectedModel, setSelectedModel] = useState("");
-  const [compareModels, setCompareModels] = useState<string[]>([]);
-  const [prompt, setPrompt] = useState(
-    "Explain how attention works in transformers.",
-  );
+  const [prompt, setPrompt] = useState("");
   const [systemPrompt, setSystemPrompt] = useState("");
   const [settings, setSettings] = useState<GenerateSettings>(DEFAULT_SETTINGS);
-  const [result, setResult] = useState<RunResult | null>(null);
-  const [compareResults, setCompareResults] = useState<RunResult[]>([]);
+  const [chatResults, setChatResults] = useState<RunResult[]>([]);
   const [history, setHistory] = useState<RunResult[]>([]);
+  const [favoriteModelNames, setFavoriteModelNames] = useState<string[]>([]);
   const [presets, setPresets] = useState<Preset[]>(DEFAULT_PRESETS);
   const [stylingPreset, setStylingPreset] =
     useState<StylingPresetId>("midnight-garden");
@@ -142,41 +157,66 @@ export default function Home() {
   const [error, setError] = useState("");
   const [statusOpen, setStatusOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(true);
-  const [thinkingEnabled, setThinkingEnabled] = useState(false);
+  const [reasoningMode, setReasoningMode] = useState<ReasoningMode>("off");
   const catalogSeededRef = useRef(false);
   const streamingRunIdRef = useRef<string | null>(null);
   const streamBufferRef = useRef({ response: "", thinking: "" });
   const streamFlushTimerRef = useRef<number | null>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
+  const chatShouldStickToBottomRef = useRef(true);
+  const streamingChatIndexRef = useRef(-1);
 
-  const modelNames = useMemo(() => models.map((model) => model.name), [models]);
-  const selectedDetails = models.find((model) => model.name === selectedModel);
+  const modelsByName = useMemo(
+    () => new Map(models.map((model) => [model.name, model])),
+    [models],
+  );
+  const runningByName = useMemo(() => {
+    const map = new Map<string, RunningModel>();
+    for (const model of running) {
+      map.set(model.name, model);
+      if (model.model) map.set(model.model, model);
+    }
+    return map;
+  }, [running]);
+  const selectedDetails = modelsByName.get(selectedModel);
   const selectedMetadata = selectedModel ? modelMetadata[selectedModel] : undefined;
-  const thinkingSupported = Boolean(selectedMetadata?.supports_thinking);
+  const reasoningModes = selectedMetadata?.reasoning_modes ?? EMPTY_REASONING_MODES;
   const selectedModelLabel =
     selectedModel
       .split("/")
       .pop()
       ?.replace(/:latest$/, "") || "No model";
-  const selectedModelLoaded = running.some(
-    (model) => model.name === selectedModel || model.model === selectedModel,
-  );
-  const selectedRunningModel = running.find(
-    (model) => model.name === selectedModel || model.model === selectedModel,
-  );
+  const selectedRunningModel = runningByName.get(selectedModel);
+  const selectedModelLoaded = Boolean(selectedRunningModel);
   const ollamaInstalled = status?.ollama_installed ?? true;
   const rightPanelVisible = workspace === "lab" && configOpen;
-  const visibleResults =
-    activeTab === "history"
-      ? history
-      : activeTab === "chat"
-        ? result
-          ? [result]
-          : []
-        : compareResults;
+
+  const flushStreamingBuffers = useCallback(() => {
+    streamFlushTimerRef.current = null;
+    const { response, thinking } = streamBufferRef.current;
+    if (!response && !thinking) return;
+    streamBufferRef.current = { response: "", thinking: "" };
+    setChatResults((current) => {
+      const idx = streamingChatIndexRef.current;
+      if (idx < 0 || idx >= current.length) return current;
+      const target = current[idx];
+      return [
+        ...current.slice(0, idx),
+        {
+          ...target,
+          response: response ? target.response + response : target.response,
+          thinking: thinking
+            ? (target.thinking ?? "") + thinking
+            : target.thinking,
+        },
+        ...current.slice(idx + 1),
+      ];
+    });
+  }, []);
 
   useEffect(() => {
     setHistory(storage.get("model-yard-history", []));
+    setFavoriteModelNames(storage.get("model-yard-favorite-models", []));
     setPresets(storage.get("model-yard-presets", DEFAULT_PRESETS));
     setStylingPreset(
       storage.get<StylingPresetId>("model-yard-styling-preset", "midnight-garden"),
@@ -193,21 +233,6 @@ export default function Home() {
   }, []);
   useEffect(() => {
     if (!isTauriRuntime()) return;
-    const flushStreamingBuffers = () => {
-      streamFlushTimerRef.current = null;
-      const { response, thinking } = streamBufferRef.current;
-      if (!response && !thinking) return;
-      streamBufferRef.current = { response: "", thinking: "" };
-      setResult((current) =>
-        current
-          ? {
-              ...current,
-              response: response ? current.response + response : current.response,
-              thinking: thinking ? (current.thinking ?? "") + thinking : current.thinking,
-            }
-          : current,
-      );
-    };
     const scheduleStreamingFlush = () => {
       if (streamFlushTimerRef.current !== null) return;
       streamFlushTimerRef.current = window.setTimeout(flushStreamingBuffers, 50);
@@ -225,7 +250,7 @@ export default function Home() {
     const unlistenPull = listen<PullProgressPayload>("pull-progress", (event) => {
       setActivePullModel(event.payload.model);
       setDownloadPopupOpen(true);
-      setPullProgress((current) => [...current, event.payload.progress]);
+      setPullProgress((current) => compactPullProgress(current, event.payload.progress));
     });
 
     return () => {
@@ -238,11 +263,15 @@ export default function Home() {
       unlistenThinking.then((unlisten) => unlisten());
       unlistenPull.then((unlisten) => unlisten());
     };
-  }, []);
+  }, [flushStreamingBuffers]);
 
   useEffect(
     () => storage.set("model-yard-history", history.slice(0, 100)),
     [history],
+  );
+  useEffect(
+    () => storage.set("model-yard-favorite-models", favoriteModelNames),
+    [favoriteModelNames],
   );
   useEffect(() => storage.set("model-yard-presets", presets), [presets]);
   useEffect(
@@ -251,14 +280,23 @@ export default function Home() {
   );
   useEffect(() => storage.set("model-yard-settings", settings), [settings]);
   useEffect(() => {
-    if (!thinkingSupported) setThinkingEnabled(false);
-  }, [thinkingSupported]);
+    setChatResults([]);
+  }, [selectedModel]);
+  useEffect(() => {
+    if (!reasoningModes.length) {
+      setReasoningMode("off");
+      return;
+    }
+    if (!reasoningModes.includes(reasoningMode)) setReasoningMode(reasoningModes[0]);
+  }, [reasoningMode, reasoningModes]);
+  const latestChatResult = chatResults[chatResults.length - 1];
   useEffect(() => {
     if (busy !== "chat") return;
     const element = chatScrollRef.current;
     if (!element) return;
+    if (!chatShouldStickToBottomRef.current) return;
     element.scrollTop = element.scrollHeight;
-  }, [result?.response, result?.thinking, busy]);
+  }, [latestChatResult?.response, latestChatResult?.thinking, busy]);
   useEffect(() => {
     if (workspace !== "models" || catalogSeededRef.current) return;
     catalogSeededRef.current = true;
@@ -283,8 +321,6 @@ export default function Home() {
       );
       setRunning(nextRunning);
       if (!selectedModel && nextModels[0]) setSelectedModel(nextModels[0].name);
-      if (!compareModels.length && nextModels.length)
-        setCompareModels(nextModels.slice(0, 2).map((model) => model.name));
     } catch (err) {
       setError(formatError(err));
     }
@@ -293,25 +329,32 @@ export default function Home() {
   async function runModel(
     model: string,
     runPrompt = prompt,
+    history: RunResult[] = [],
     runId?: string,
   ): Promise<RunResult> {
     const request: ChatRequest = {
       run_id: runId,
       model,
-      prompt: runPrompt,
-      system_prompt: systemPrompt,
+      messages: buildChatMessages(systemPrompt, history, runPrompt),
       options: settings,
     };
-    if (modelMetadata[model]?.supports_thinking) request.think = thinkingEnabled;
+    const selectedReasoningModes = modelMetadata[model]?.reasoning_modes ?? [];
+    if (selectedReasoningModes.includes(reasoningMode)) {
+      request.think =
+        reasoningMode === "off" ? false : reasoningMode === "on" ? true : reasoningMode;
+    }
     return call<RunResult>("chat_model", {
       request,
     });
   }
 
-  async function runChat() {
+  async function runChat(runPrompt = prompt) {
     if (!selectedModel) return;
+    const submittedPrompt = runPrompt.trim();
+    if (!submittedPrompt) return;
     const runId = crypto.randomUUID();
     streamingRunIdRef.current = runId;
+    chatShouldStickToBottomRef.current = true;
     streamBufferRef.current = { response: "", thinking: "" };
     if (streamFlushTimerRef.current !== null) {
       window.clearTimeout(streamFlushTimerRef.current);
@@ -319,77 +362,118 @@ export default function Home() {
     }
     setBusy("chat");
     setError("");
-    setResult({
+    setPrompt("");
+    const placeholder: RunResult = {
       model: selectedModel,
-      prompt,
+      prompt: submittedPrompt,
       response: "",
       created_at: new Date().toISOString(),
-    });
+    };
+    setChatResults((current) => [...current, placeholder]);
+    streamingChatIndexRef.current = chatResults.length;
     try {
-      const next = await runModel(selectedModel, prompt, runId);
+      const history = chatResults;
+      const next = await runModel(selectedModel, submittedPrompt, history, runId);
+      if (streamingRunIdRef.current !== runId) return;
       streamBufferRef.current = { response: "", thinking: "" };
       if (streamFlushTimerRef.current !== null) {
         window.clearTimeout(streamFlushTimerRef.current);
         streamFlushTimerRef.current = null;
       }
-      setResult(next);
+      setChatResults((current) => {
+        const nextResults = [...current];
+        nextResults[nextResults.length - 1] = next;
+        return nextResults;
+      });
       setHistory((items) => [next, ...items].slice(0, 100));
       refreshAll();
     } catch (err) {
+      if (streamingRunIdRef.current !== runId) return;
       setError(formatError(err));
+      setChatResults((current) => current.slice(0, -1));
     } finally {
-      streamingRunIdRef.current = null;
-      setBusy("");
+      if (streamingRunIdRef.current === runId) {
+        streamingRunIdRef.current = null;
+        streamingChatIndexRef.current = -1;
+        setBusy("");
+      }
     }
   }
 
-  async function runCompare() {
-    if (!compareModels.length) return;
-    setBusy("compare");
+  function stopChat() {
+    if (busy !== "chat") return;
+    const runId = streamingRunIdRef.current;
+    streamingRunIdRef.current = null;
+    streamingChatIndexRef.current = -1;
+    if (runId) {
+      void call("cancel_chat", { runId }).catch(() => undefined);
+    }
+    if (streamFlushTimerRef.current !== null) {
+      window.clearTimeout(streamFlushTimerRef.current);
+      streamFlushTimerRef.current = null;
+    }
+    flushStreamingBuffers();
+    setBusy("");
+  }
+
+  async function rerunChat(index: number) {
+    if (!selectedModel) return;
+    if (busy) return;
+    const existing = chatResults[index];
+    if (!existing) return;
+    const runId = crypto.randomUUID();
+    streamingRunIdRef.current = runId;
+    streamingChatIndexRef.current = index;
+    chatShouldStickToBottomRef.current = true;
+    streamBufferRef.current = { response: "", thinking: "" };
+    if (streamFlushTimerRef.current !== null) {
+      window.clearTimeout(streamFlushTimerRef.current);
+      streamFlushTimerRef.current = null;
+    }
+    setBusy("chat");
     setError("");
-    setCompareResults([]);
+    setChatResults((current) => {
+      const target = current[index];
+      if (!target) return current;
+      return [
+        ...current.slice(0, index),
+        { ...target, response: "", thinking: undefined },
+        ...current.slice(index + 1),
+      ];
+    });
     try {
-      const results = await Promise.all(
-        compareModels.map((model) => runModel(model)),
-      );
-      setCompareResults(results);
-      setHistory((items) => [...results, ...items].slice(0, 100));
+      const history = chatResults.slice(0, index);
+      const next = await runModel(selectedModel, existing.prompt, history, runId);
+      if (streamingRunIdRef.current !== runId) return;
+      streamBufferRef.current = { response: "", thinking: "" };
+      if (streamFlushTimerRef.current !== null) {
+        window.clearTimeout(streamFlushTimerRef.current);
+        streamFlushTimerRef.current = null;
+      }
+      setChatResults((current) => {
+        if (index >= current.length) return current;
+        return [
+          ...current.slice(0, index),
+          next,
+          ...current.slice(index + 1),
+        ];
+      });
+      setHistory((items) => [next, ...items].slice(0, 100));
       refreshAll();
     } catch (err) {
+      if (streamingRunIdRef.current !== runId) return;
       setError(formatError(err));
     } finally {
-      setBusy("");
+      if (streamingRunIdRef.current === runId) {
+        streamingRunIdRef.current = null;
+        streamingChatIndexRef.current = -1;
+        setBusy("");
+      }
     }
   }
 
-  async function runBench() {
-    const suite = [
-      "Return a JSON object with keys summary and risk for running local LLMs.",
-      "Explain the difference between temperature and top_p in two paragraphs.",
-      "Write a bash command to list the ten largest files under the current directory.",
-    ];
-    const targets = compareModels.length
-      ? compareModels
-      : selectedModel
-        ? [selectedModel]
-        : [];
-    setBusy("bench");
-    setError("");
-    try {
-      const results: RunResult[] = [];
-      for (const benchPrompt of suite)
-        results.push(
-          ...(await Promise.all(
-            targets.map((model) => runModel(model, benchPrompt)),
-          )),
-        );
-      setCompareResults(results);
-      setHistory((items) => [...results, ...items].slice(0, 100));
-    } catch (err) {
-      setError(formatError(err));
-    } finally {
-      setBusy("");
-    }
+  function deleteChatTurn(index: number) {
+    setChatResults((current) => current.filter((_, i) => i !== index));
   }
 
   async function pullModel() {
@@ -409,7 +493,7 @@ export default function Home() {
       const progress = await call<PullProgress[]>("pull_model", {
         name: nextName,
       });
-      setPullProgress(progress);
+      setPullProgress(compactPullProgressList(progress));
       await refreshAll();
     } catch (err) {
       setError(formatError(err));
@@ -462,13 +546,21 @@ export default function Home() {
     try {
       await call("delete_model", { name });
       if (selectedModel === name) setSelectedModel("");
-      setCompareModels((items) => items.filter((item) => item !== name));
+      setFavoriteModelNames((items) => items.filter((item) => item !== name));
       await refreshAll();
     } catch (err) {
       setError(formatError(err));
     } finally {
       setBusy("");
     }
+  }
+
+  function toggleFavoriteModel(name: string) {
+    setFavoriteModelNames((items) =>
+      items.includes(name)
+        ? items.filter((item) => item !== name)
+        : [...items, name],
+    );
   }
 
   async function loadSelectedModel() {
@@ -503,15 +595,19 @@ export default function Home() {
     }
   }
 
-  function savePreset() {
-    const name = prompt.slice(0, 42).trim() || "Untitled prompt";
+  function savePreset(name?: string) {
+    const presetName = name?.trim() || prompt.slice(0, 42).trim() || "Untitled prompt";
     setPresets((items) =>
-      [{ id: crypto.randomUUID(), name, prompt }, ...items].slice(0, 30),
+      [{ id: crypto.randomUUID(), name: presetName, prompt }, ...items].slice(0, 30),
     );
   }
 
+  function deletePreset(id: string) {
+    setPresets((items) => items.filter((item) => item.id !== id));
+  }
+
   function exportResults(kind: "json" | "md") {
-    const payload = activeTab === "chat" && result ? [result] : compareResults;
+    const payload = chatResults;
     if (!payload.length) return;
     const data =
       kind === "json"
@@ -542,12 +638,7 @@ export default function Home() {
     }
   }
 
-  const runAction =
-    activeTab === "compare"
-      ? runCompare
-      : activeTab === "bench"
-        ? runBench
-        : runChat;
+  const runAction = runChat;
   const centerMaxWidth = workspace === "lab" ? "max-w-[760px]" : "max-w-[920px]";
   const latestPullProgress = pullProgress[pullProgress.length - 1];
   const pullOverallProgress = useMemo(
@@ -566,11 +657,13 @@ export default function Home() {
           : "grid-cols-[260px_minmax(520px,1fr)_0px] max-[1080px]:grid-cols-[240px_minmax(420px,1fr)]",
       )}
     >
-      <BackgroundPicture
-        image={midnightGardenBackground}
-        pictureClassName="model-yard-background pointer-events-none absolute inset-0 z-0 overflow-hidden"
-        className="h-full w-full object-cover object-left"
-      />
+      {backgroundImageEnabled && (
+        <BackgroundPicture
+          image={midnightGardenBackground}
+          pictureClassName="model-yard-background pointer-events-none fixed inset-0 z-0 overflow-hidden"
+          className="h-full w-full object-cover object-left"
+        />
+      )}
 
       <aside className="row-start-1 min-h-0 min-w-0 max-[760px]:hidden">
         <Card className="flex h-full min-w-0 flex-col overflow-hidden rounded-xl">
@@ -589,7 +682,6 @@ export default function Home() {
                   models={models}
                   running={running}
                   selectedModel={selectedModel}
-                  onBack={() => setWorkspace("lab")}
                   onSelectModel={setSelectedModel}
                 />
               ) : (
@@ -597,9 +689,10 @@ export default function Home() {
                   history={history}
                   models={models}
                   selectedModel={selectedModel}
+                  selectedRunningModel={selectedRunningModel}
                   onOpenModels={() => setWorkspace("models")}
                   onSelectModel={setSelectedModel}
-                  onSetTab={setActiveTab}
+                  onSelectHistoryPrompt={setPrompt}
                 />
               )}
             </CardContent>
@@ -622,6 +715,12 @@ export default function Home() {
 
         <div
           ref={chatScrollRef}
+          onScroll={(event) => {
+            const element = event.currentTarget;
+            const distanceFromBottom =
+              element.scrollHeight - element.scrollTop - element.clientHeight;
+            chatShouldStickToBottomRef.current = distanceFromBottom < 80;
+          }}
           className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
         >
           <div className={cn("mx-auto w-full px-[22px] pb-8 pt-[22px]", centerMaxWidth)}>
@@ -667,40 +766,13 @@ export default function Home() {
                   onSelectModel={setSelectedModel}
                 />
               ) : (
-              <>
-                {activeTab === "compare" && (
-                  <div className="flex flex-wrap gap-1.5 pb-[18px]">
-                    {models.map((model) => (
-                      <button
-                        key={model.name}
-                        className={cn(
-                          "rounded-full border border-border bg-background px-3 py-1.5 text-xs text-muted-foreground",
-                          compareModels.includes(model.name) &&
-                            "border-primary bg-accent text-foreground",
-                        )}
-                        onClick={() =>
-                          setCompareModels((items) =>
-                            items.includes(model.name)
-                              ? items.filter((item) => item !== model.name)
-                              : [...items, model.name],
-                          )
-                        }
-                      >
-                        {model.name}
-                      </button>
-                    ))}
-                  </div>
-                )}
-                {activeTab === "bench" ? (
-                  <BenchTable results={visibleResults} />
-                ) : (
                   <ChatThread
-                    results={visibleResults}
-                    activeTab={activeTab}
+                    results={chatResults}
                     busy={busy}
+                    streamingIndex={streamingChatIndexRef.current}
+                    onRerun={rerunChat}
+                    onDelete={deleteChatTurn}
                   />
-                )}
-              </>
               )}
             </Suspense>
           </div>
@@ -723,16 +795,18 @@ export default function Home() {
               onChange={setPrompt}
               models={models}
               selectedModel={selectedModel}
-              activeTab={activeTab}
               busy={busy}
-              thinkingEnabled={thinkingEnabled}
-              thinkingSupported={thinkingSupported}
-              selectedModelLoaded={selectedModelLoaded}
+              reasoningMode={reasoningMode}
+              reasoningModes={reasoningModes}
+              favoriteModelNames={favoriteModelNames}
+              presets={presets}
               onSelectModel={setSelectedModel}
-              onThinkingChange={setThinkingEnabled}
-              onEjectSelectedModel={ejectSelectedModel}
-              onRefresh={refreshAll}
+              onToggleFavoriteModel={toggleFavoriteModel}
+              onReasoningModeChange={setReasoningMode}
+              onSavePreset={savePreset}
+              onDeletePreset={deletePreset}
               onRun={runAction}
+              onStop={stopChat}
             />
             <div className="mx-auto flex w-full max-w-[760px] items-center justify-between gap-3 py-1 text-[10px] text-muted-foreground">
               <div className="flex items-center gap-1 text-[10px]">
@@ -762,12 +836,11 @@ export default function Home() {
       {workspace === "lab" && (
         <ConfigSidebar
           busy={busy}
-          compareResultCount={compareResults.length}
           configOpen={configOpen}
           historyCount={history.length}
           pullName={pullName}
           pullProgress={pullProgress}
-          result={result}
+          result={chatResults[chatResults.length - 1] ?? null}
           running={running}
           selectedDetails={selectedDetails}
           selectedMetadata={selectedMetadata}
@@ -789,54 +862,54 @@ export default function Home() {
       )}
 
       <Card className="col-start-1 col-end-3 row-start-2 grid h-10 grid-cols-[1fr_auto_1fr] items-center rounded-xl px-3 text-[11px] text-muted-foreground max-[760px]:col-auto">
-        <Button
-          variant="ghost"
-          size="sm"
-          className={cn(
-            "h-7 w-fit gap-1.5 rounded-md px-2 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground",
-            workspace === "settings" && "bg-accent text-foreground",
-          )}
-          onClick={() =>
-            setWorkspace((mode) => (mode === "settings" ? "lab" : "settings"))
-          }
-        >
-          <Settings className="size-3.5" />
-          <span>Settings</span>
-        </Button>
-        <div className="justify-self-center rounded-lg border border-black/30 bg-black/25 p-1 shadow-[inset_0_1px_3px_rgba(0,0,0,0.75),inset_0_-1px_0_rgba(255,255,255,0.06)]">
-          <div className="flex items-center gap-0.5">
-            {tabs.map((tab) => {
-              const isActive = activeTab === tab;
+        <div className="flex items-center gap-1">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-7 rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+            title="Check for app updates"
+          >
+            <Download className="size-3.5" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className={cn(
+              "size-7 rounded-md text-muted-foreground hover:bg-accent hover:text-foreground",
+              !ollamaInstalled && "text-amber-400",
+            )}
+            title={ollamaInstalled ? "Ollama" : "Install Ollama"}
+            disabled={ollamaInstalled}
+            onClick={installOllama}
+          >
+            <LlamaIcon className="size-3.5" />
+          </Button>
+        </div>
+        <div className="justify-self-center">
+          <div className="relative flex items-center gap-0.5 rounded-full border border-white/[0.04] bg-[#1a1a1a] p-[3px] shadow-[inset_0_3px_6px_rgba(0,0,0,0.8),inset_0_1px_2px_rgba(0,0,0,0.6),0_1px_0_rgba(255,255,255,0.05)]">
+            {(["lab", "models", "settings"] as const).map((ws) => {
+              const label = ws === "lab" ? "Chat" : ws === "models" ? "Models" : "Settings";
+              const dotColor = ws === "lab" ? "bg-cyan-400" : ws === "models" ? "bg-emerald-400" : "bg-violet-400";
+              const active = workspace === ws;
               return (
                 <button
-                  key={tab}
+                  key={ws}
                   className={cn(
-                    "relative flex h-6 items-center rounded-md px-3 text-[11px] font-semibold capitalize transition-all duration-150",
-                    "text-muted-foreground hover:bg-white/5 hover:text-foreground",
-                    "active:translate-y-px",
-                    isActive &&
-                      cn(
-                        "translate-y-[-1px]",
-                        tabStyles[tab].active,
-                        tabStyles[tab].glow,
-                      ),
+                    "relative flex h-6 items-center gap-1.5 rounded-full px-3 text-[10px] font-semibold tracking-wide transition-all duration-200 ease-out",
+                    active
+                      ? "bg-gradient-to-b from-white/[0.15] to-white/[0.07] text-foreground shadow-[0_2px_6px_rgba(0,0,0,0.5),0_1px_2px_rgba(0,0,0,0.35),inset_0_1px_0_rgba(255,255,255,0.15)] -translate-y-[0.5px]"
+                      : "text-muted-foreground hover:text-foreground shadow-[inset_0_2px_3px_rgba(0,0,0,0.4),inset_0_0_1px_rgba(0,0,0,0.3)] hover:shadow-[inset_0_1px_2px_rgba(0,0,0,0.25)]",
                   )}
-                  onClick={() => {
-                    setWorkspace("lab");
-                    setActiveTab(tab);
-                  }}
+                  onClick={() => setWorkspace(ws)}
                 >
                   <span
                     className={cn(
-                      "mr-1.5 size-1.5 rounded-full",
-                      tab === "chat" && "bg-cyan-400",
-                      tab === "compare" && "bg-emerald-400",
-                      tab === "bench" && "bg-amber-400",
-                      tab === "history" && "bg-violet-400",
-                      isActive && "bg-slate-950/80",
+                      "size-1.5 rounded-full transition-all duration-200",
+                      dotColor,
+                      active ? "opacity-100 shadow-[0_0_6px_currentColor]" : "opacity-40",
                     )}
                   />
-                  {tab}
+                  {label}
                 </button>
               );
             })}

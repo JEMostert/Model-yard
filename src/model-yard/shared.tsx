@@ -8,33 +8,12 @@ import {
   Wand2,
   Wrench,
 } from "lucide-react";
-import type { ActiveTab, GenerateSettings, PullProgress } from "@/lib/types";
+import type { GenerateSettings, PullProgress } from "@/lib/types";
 import { DEFAULT_SETTINGS } from "@/lib/constants";
 
 export type StylingPresetId = "midnight-garden";
 export type WorkspaceMode = "lab" | "settings" | "models";
 export type SettingsSectionId = "styling" | "application" | "ollama" | "data";
-
-export const tabs: ActiveTab[] = ["chat", "compare", "bench", "history"];
-
-export const tabStyles: Record<ActiveTab, { active: string; glow: string }> = {
-  chat: {
-    active: "bg-cyan-400 text-slate-950 shadow-cyan-950/40",
-    glow: "shadow-[inset_0_1px_0_rgba(255,255,255,0.55),0_1px_0_rgba(255,255,255,0.18),0_7px_14px_rgba(34,211,238,0.24)]",
-  },
-  compare: {
-    active: "bg-emerald-400 text-slate-950 shadow-emerald-950/40",
-    glow: "shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_1px_0_rgba(255,255,255,0.16),0_7px_14px_rgba(52,211,153,0.22)]",
-  },
-  bench: {
-    active: "bg-amber-400 text-slate-950 shadow-amber-950/40",
-    glow: "shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_1px_0_rgba(255,255,255,0.16),0_7px_14px_rgba(251,191,36,0.22)]",
-  },
-  history: {
-    active: "bg-violet-400 text-slate-950 shadow-violet-950/40",
-    glow: "shadow-[inset_0_1px_0_rgba(255,255,255,0.5),0_1px_0_rgba(255,255,255,0.16),0_7px_14px_rgba(167,139,250,0.22)]",
-  },
-};
 
 const CAPABILITY_ICON: Array<{
   match: (cap: string) => boolean;
@@ -177,6 +156,31 @@ export function formatModelLabel(value: string) {
       .pop()
       ?.replace(/:latest$/, "") ?? value
   );
+}
+
+export function getModelCreator(value: string) {
+  const localName = formatModelLabel(value);
+  const [baseName] = localName.split(":");
+  const normalized = baseName
+    .replace(/[-_.]?v?\d.*$/i, "")
+    .replace(/[-_.]+$/g, "")
+    .trim();
+
+  return normalized || baseName || localName || "Local";
+}
+
+export function getModelCreatorInitials(value: string) {
+  const creator = getModelCreator(value);
+  const tokens = creator
+    .split(/[-_.\s]+/)
+    .map((token) => token.replace(/[^a-z0-9]/gi, ""))
+    .filter(Boolean);
+
+  if (tokens.length >= 2) {
+    return `${tokens[0][0]}${tokens[1][0]}`.toUpperCase();
+  }
+
+  return (tokens[0] ?? creator).slice(0, 2).toUpperCase();
 }
 
 export function formatCount(value?: number) {

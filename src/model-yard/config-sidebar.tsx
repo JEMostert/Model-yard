@@ -11,7 +11,6 @@ import { formatCount, formatModelLabel } from "@/src/model-yard/shared";
 
 export function ConfigSidebar({
   busy,
-  compareResultCount,
   configOpen,
   historyCount,
   pullName,
@@ -36,7 +35,6 @@ export function ConfigSidebar({
   onSystemPromptChange,
 }: {
   busy: string;
-  compareResultCount: number;
   configOpen: boolean;
   historyCount: number;
   pullName: string;
@@ -149,7 +147,6 @@ export function ConfigSidebar({
               </div>
               <div className="mt-3 space-y-1.5">
                 <Fact label="History" value={`${historyCount} runs`} />
-                <Fact label="Compare" value={`${compareResultCount} results`} />
                 <Fact label="Current" value={result ? "available" : "empty"} />
               </div>
             </ConfigSection>

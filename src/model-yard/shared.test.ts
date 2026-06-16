@@ -5,6 +5,8 @@ import {
   formatCount,
   formatModelLabel,
   formatUpdatedLabel,
+  getModelCreator,
+  getModelCreatorInitials,
   normalizeSettings,
   parsePullCount,
   quantKey,
@@ -37,6 +39,14 @@ describe("model-yard shared helpers", () => {
     expect(formatModelLabel("library/minicpm5:latest")).toBe("minicpm5");
     expect(formatCount(131072)).toBe("131,072");
     expect(formatCount()).toBe("unknown");
+  });
+
+  it("derives local model creator names and initials", () => {
+    expect(getModelCreator("qwen2.5-coder:latest")).toBe("qwen");
+    expect(getModelCreatorInitials("qwen2.5-coder:latest")).toBe("QW");
+    expect(getModelCreator("library/gemma3:latest")).toBe("gemma");
+    expect(getModelCreatorInitials("library/gemma3:latest")).toBe("GE");
+    expect(getModelCreatorInitials("deep-seek-r1:8b")).toBe("DS");
   });
 
   it("parses abbreviated pull counts", () => {

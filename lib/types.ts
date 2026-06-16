@@ -14,18 +14,23 @@ export type OllamaModel = {
   capabilities?: string[];
 };
 
+export type ChatMessage = {
+  role: "system" | "user" | "assistant";
+  content: string;
+};
+
 export type ChatRequest = {
   run_id?: string;
   model: string;
-  prompt: string;
-  system_prompt: string;
+  messages: ChatMessage[];
   options: GenerateSettings;
-  think?: boolean;
+  think?: boolean | "low" | "medium" | "high";
 };
 
 export type ModelMetadata = {
   name: string;
   supports_thinking: boolean;
+  reasoning_modes: ReasoningMode[];
   context_length?: number;
   parameter_size?: string;
   quantization_level?: string;
@@ -34,6 +39,8 @@ export type ModelMetadata = {
   basename?: string;
   organization?: string;
 };
+
+export type ReasoningMode = "off" | "on" | "low" | "medium" | "high";
 
 export type RunningModel = {
   name: string;
@@ -108,4 +115,4 @@ export type PullProgress = {
   completed?: number;
 };
 
-export type ActiveTab = "chat" | "compare" | "bench" | "history";
+

@@ -1,16 +1,31 @@
 use chrono::Utc;
-use futures_util::StreamExt;
+use futures_util::{
+    future::{select, Either},
+    pin_mut, stream, StreamExt,
+};
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::process::Stdio;
+use std::collections::{HashMap, HashSet};
+use std::{process::Stdio, sync::LazyLock};
 use tauri::{Emitter, Manager};
 use tokio::process::Command;
+use tokio::sync::{Mutex, Notify};
 
 const OLLAMA_URL: &str = "http://localhost:11434";
 const OLLAMA_LIBRARY_URL: &str = "https://ollama.com";
+const METADATA_CONCURRENCY: usize = 6;
+
+static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(900))
+        .build()
+        .expect("valid reqwest client")
+});
+static CANCELLED_CHAT_RUNS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+static CHAT_CANCEL_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ModelDetails {
@@ -76,13 +91,18 @@ struct GenerateSettings {
 }
 
 #[derive(Debug, Deserialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ChatRequest {
     run_id: Option<String>,
     model: String,
-    prompt: String,
-    system_prompt: String,
+    messages: Vec<ChatMessage>,
     options: GenerateSettings,
-    think: Option<bool>,
+    think: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +118,7 @@ struct ShowResponse {
 struct ModelMetadata {
     name: String,
     supports_thinking: bool,
+    reasoning_modes: Vec<String>,
     context_length: Option<u64>,
     parameter_size: Option<String>,
     quantization_level: Option<String>,
@@ -188,7 +209,9 @@ fn process_chat_stream_line(
             .or_else(|| message.get("reasoning_content"))
             .and_then(Value::as_str)
         {
-            thinking_text.get_or_insert_with(String::new).push_str(reasoning);
+            thinking_text
+                .get_or_insert_with(String::new)
+                .push_str(reasoning);
             if let Some(run_id) = run_id {
                 let _ = app.emit(
                     "chat-thinking",
@@ -207,6 +230,30 @@ fn process_chat_stream_line(
     }
 
     Ok(())
+}
+
+async fn mark_chat_cancelled(run_id: String) {
+    CANCELLED_CHAT_RUNS.lock().await.insert(run_id);
+    CHAT_CANCEL_NOTIFY.notify_waiters();
+}
+
+async fn clear_chat_cancelled(run_id: &Option<String>) {
+    if let Some(run_id) = run_id {
+        CANCELLED_CHAT_RUNS.lock().await.remove(run_id);
+    }
+}
+
+async fn is_chat_cancelled(run_id: &Option<String>) -> bool {
+    let Some(run_id) = run_id else {
+        return false;
+    };
+    CANCELLED_CHAT_RUNS.lock().await.contains(run_id)
+}
+
+async fn wait_for_chat_cancel(run_id: &Option<String>) {
+    while !is_chat_cancelled(run_id).await {
+        CHAT_CANCEL_NOTIFY.notified().await;
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -257,10 +304,7 @@ fn spawn_terminal_owned(program: &str, args: &[String]) -> bool {
 }
 
 fn client() -> Client {
-    Client::builder()
-        .timeout(std::time::Duration::from_secs(900))
-        .build()
-        .expect("valid reqwest client")
+    HTTP_CLIENT.clone()
 }
 
 fn string_model_info(model_info: &Option<HashMap<String, Value>>, key: &str) -> Option<String> {
@@ -288,6 +332,95 @@ fn supports_thinking(show: &ShowResponse) -> bool {
                 || lower.contains("reasoning_content")
                 || lower.contains("<think>")
         })
+}
+
+fn reasoning_modes(name: &str, show: &ShowResponse) -> Vec<String> {
+    if !supports_thinking(show) {
+        return Vec::new();
+    }
+
+    let mut sources = vec![name.to_string()];
+    sources.extend(
+        [&show.template, &show.modelfile, &show.parameters]
+            .iter()
+            .filter_map(|value| value.as_ref().cloned()),
+    );
+    if let Some(model_info) = &show.model_info {
+        for key in [
+            "general.basename",
+            "general.organization",
+            "general.architecture",
+        ] {
+            if let Some(value) = model_info.get(key).and_then(Value::as_str) {
+                sources.push(value.to_string());
+            }
+        }
+    }
+
+    let combined = sources.join("\n").to_lowercase();
+    if combined.contains("gpt-oss")
+        || combined.contains("reasoning_effort")
+        || combined.contains("reasoning effort")
+    {
+        return ["low", "medium", "high"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+    }
+
+    ["off", "on"].into_iter().map(ToString::to_string).collect()
+}
+
+async fn inspect_model_metadata(
+    client: Client,
+    name: String,
+) -> Result<Option<ModelMetadata>, String> {
+    let response = client
+        .post(format!("{OLLAMA_URL}/api/show"))
+        .json(&json!({ "model": name }))
+        .send()
+        .await
+        .map_err(|error| format!("Could not inspect Ollama model: {error}"))?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+
+    let show = response
+        .json::<ShowResponse>()
+        .await
+        .map_err(|error| error.to_string())?;
+    let context_length = show
+        .details
+        .as_ref()
+        .and_then(|details| details.context_length)
+        .or_else(|| number_model_info(&show.model_info, "llama.context_length"));
+    let parameter_size = show
+        .details
+        .as_ref()
+        .and_then(|details| details.parameter_size.clone())
+        .or_else(|| string_model_info(&show.model_info, "general.size_label"));
+    let quantization_level = show
+        .details
+        .as_ref()
+        .and_then(|details| details.quantization_level.clone());
+    let family = show
+        .details
+        .as_ref()
+        .and_then(|details| details.family.clone());
+
+    let reasoning_modes = reasoning_modes(&name, &show);
+    Ok(Some(ModelMetadata {
+        name,
+        supports_thinking: supports_thinking(&show),
+        reasoning_modes,
+        context_length,
+        parameter_size,
+        quantization_level,
+        family,
+        architecture: string_model_info(&show.model_info, "general.architecture"),
+        basename: string_model_info(&show.model_info, "general.basename"),
+        organization: string_model_info(&show.model_info, "general.organization"),
+    }))
 }
 
 fn strip_html(value: &str) -> String {
@@ -346,8 +479,8 @@ fn infer_quant(name: &str) -> Option<String> {
     let tag = name.split(':').nth(1)?;
     let lower = tag.to_lowercase();
     for marker in [
-        "q2_k", "q3_k_s", "q3_k_m", "q3_k_l", "q4_0", "q4_1", "q4_k_s", "q4_k_m",
-        "q5_0", "q5_1", "q5_k_s", "q5_k_m", "q6_k", "q8_0", "fp16", "f16",
+        "q2_k", "q3_k_s", "q3_k_m", "q3_k_l", "q4_0", "q4_1", "q4_k_s", "q4_k_m", "q5_0", "q5_1",
+        "q5_k_s", "q5_k_m", "q6_k", "q8_0", "fp16", "f16",
     ] {
         if lower.contains(marker) {
             return Some(marker.to_uppercase());
@@ -401,7 +534,10 @@ fn parse_catalog_search(html: &str) -> Vec<CatalogModel> {
                 pulls: captures_text(block, r#"(?s)<span x-test-pull-count>(.*?)</span>"#),
                 tag_count: captures_text(block, r#"(?s)<span x-test-tag-count>(.*?)</span>"#),
                 updated: captures_text(block, r#"(?s)<span x-test-updated>(.*?)</span>"#),
-                capabilities: captures_many(block, r#"(?s)<span x-test-capability[^>]*>(.*?)</span>"#),
+                capabilities: captures_many(
+                    block,
+                    r#"(?s)<span x-test-capability[^>]*>(.*?)</span>"#,
+                ),
                 sizes: captures_many(block, r#"(?s)<span x-test-size[^>]*>(.*?)</span>"#),
             })
         })
@@ -409,8 +545,8 @@ fn parse_catalog_search(html: &str) -> Vec<CatalogModel> {
 }
 
 fn parse_catalog_tags(html: &str) -> Vec<CatalogTag> {
-    let mobile_re =
-        Regex::new(r#"(?s)<a href="/library/([^"]+)" class="md:hidden.*?</a>"#).expect("valid regex");
+    let mobile_re = Regex::new(r#"(?s)<a href="/library/([^"]+)" class="md:hidden.*?</a>"#)
+        .expect("valid regex");
     let name_re = Regex::new(r#"/library/([^"]+)""#).expect("valid regex");
     let digest_re = Regex::new(r#">([a-f0-9]{12})</span>"#).expect("valid regex");
     let size_context_re =
@@ -481,12 +617,7 @@ async fn install_ollama() -> Result<(), String> {
         ("xterm", vec!["-e", "bash", "-lc", script]),
     ]
     .into_iter()
-    .map(|(program, args)| {
-        (
-            program,
-            args.into_iter().map(ToString::to_string).collect(),
-        )
-    })
+    .map(|(program, args)| (program, args.into_iter().map(ToString::to_string).collect()))
     .collect();
 
     for (program, args) in candidates.iter() {
@@ -554,54 +685,14 @@ async fn ollama_status() -> Result<LabStatus, String> {
 #[tauri::command]
 async fn model_metadata(names: Vec<String>) -> Result<Vec<ModelMetadata>, String> {
     let client = client();
-    let mut metadata = Vec::new();
-
-    for name in names {
-        let response = client
-            .post(format!("{OLLAMA_URL}/api/show"))
-            .json(&json!({ "model": name }))
-            .send()
-            .await
-            .map_err(|error| format!("Could not inspect Ollama model: {error}"))?;
-        if !response.status().is_success() {
-            continue;
-        }
-
-        let show = response
-            .json::<ShowResponse>()
-            .await
-            .map_err(|error| error.to_string())?;
-        let context_length = show
-            .details
-            .as_ref()
-            .and_then(|details| details.context_length)
-            .or_else(|| number_model_info(&show.model_info, "llama.context_length"));
-        let parameter_size = show
-            .details
-            .as_ref()
-            .and_then(|details| details.parameter_size.clone())
-            .or_else(|| string_model_info(&show.model_info, "general.size_label"));
-        let quantization_level = show
-            .details
-            .as_ref()
-            .and_then(|details| details.quantization_level.clone());
-        let family = show
-            .details
-            .as_ref()
-            .and_then(|details| details.family.clone());
-
-        metadata.push(ModelMetadata {
-            name,
-            supports_thinking: supports_thinking(&show),
-            context_length,
-            parameter_size,
-            quantization_level,
-            family,
-            architecture: string_model_info(&show.model_info, "general.architecture"),
-            basename: string_model_info(&show.model_info, "general.basename"),
-            organization: string_model_info(&show.model_info, "general.organization"),
-        });
-    }
+    let metadata = stream::iter(names.into_iter().map(|name| {
+        let client = client.clone();
+        async move { inspect_model_metadata(client, name).await }
+    }))
+    .buffer_unordered(METADATA_CONCURRENCY)
+    .filter_map(|result| async move { result.ok().flatten() })
+    .collect()
+    .await;
 
     Ok(metadata)
 }
@@ -644,10 +735,7 @@ fn running_model_identifier(model: &RunningModel) -> &str {
     model.model.as_deref().unwrap_or(&model.name)
 }
 
-fn other_running_model_names<'a>(
-    models: &'a [RunningModel],
-    target: &str,
-) -> Vec<&'a str> {
+fn other_running_model_names<'a>(models: &'a [RunningModel], target: &str) -> Vec<&'a str> {
     models
         .iter()
         .map(running_model_identifier)
@@ -730,7 +818,10 @@ async fn search_catalog(query: String) -> Result<Vec<CatalogModel>, String> {
     }
 
     let response = client()
-        .get(format!("{OLLAMA_LIBRARY_URL}/search?q={}", encode_query(query)))
+        .get(format!(
+            "{OLLAMA_LIBRARY_URL}/search?q={}",
+            encode_query(query)
+        ))
         .send()
         .await
         .map_err(|error| format!("Could not search Ollama catalog: {error}"))?;
@@ -744,7 +835,10 @@ async fn search_catalog(query: String) -> Result<Vec<CatalogModel>, String> {
 
 #[tauri::command]
 async fn catalog_model_tags(model: String) -> Result<Vec<CatalogTag>, String> {
-    let model = model.trim().trim_start_matches("library/").trim_matches('/');
+    let model = model
+        .trim()
+        .trim_start_matches("library/")
+        .trim_matches('/');
     if model.is_empty() || model.contains(':') {
         return Ok(Vec::new());
     }
@@ -763,14 +857,27 @@ async fn catalog_model_tags(model: String) -> Result<Vec<CatalogTag>, String> {
 }
 
 #[tauri::command]
+async fn cancel_chat(run_id: String) -> Result<(), String> {
+    mark_chat_cancelled(run_id).await;
+    Ok(())
+}
+
+#[tauri::command]
 async fn chat_model(app: tauri::AppHandle, request: ChatRequest) -> Result<RunResult, String> {
+    clear_chat_cancelled(&request.run_id).await;
     unload_other_models(&request.model).await?;
 
-    let mut messages = Vec::new();
-    if !request.system_prompt.trim().is_empty() {
-        messages.push(json!({ "role": "system", "content": request.system_prompt }));
-    }
-    messages.push(json!({ "role": "user", "content": request.prompt }));
+    let prompt = request
+        .messages
+        .last()
+        .map(|message| message.content.clone())
+        .unwrap_or_default();
+
+    let messages: Vec<Value> = request
+        .messages
+        .into_iter()
+        .map(|message| json!({ "role": message.role, "content": message.content }))
+        .collect();
 
     let options = json!({
             "temperature": request.options.temperature,
@@ -814,7 +921,18 @@ async fn chat_model(app: tauri::AppHandle, request: ChatRequest) -> Result<RunRe
     let mut eval_count = None;
     let mut eval_duration = None;
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next_chunk = stream.next();
+        let cancel = wait_for_chat_cancel(&run_id);
+        pin_mut!(next_chunk, cancel);
+        let chunk = match select(next_chunk, cancel).await {
+            Either::Left((chunk, _)) => chunk,
+            Either::Right((_, _)) => break,
+        };
+
+        let Some(chunk) = chunk else {
+            break;
+        };
         let chunk = chunk.map_err(|error| format!("Ollama stream failed: {error}"))?;
         pending.extend_from_slice(&chunk);
 
@@ -833,9 +951,10 @@ async fn chat_model(app: tauri::AppHandle, request: ChatRequest) -> Result<RunRe
             )?;
         }
     }
+    let was_cancelled = is_chat_cancelled(&run_id).await;
 
     let final_line = String::from_utf8_lossy(&pending).trim().to_string();
-    if !final_line.is_empty() {
+    if !was_cancelled && !final_line.is_empty() {
         process_chat_stream_line(
             &final_line,
             &app,
@@ -847,6 +966,7 @@ async fn chat_model(app: tauri::AppHandle, request: ChatRequest) -> Result<RunRe
             &mut eval_duration,
         )?;
     }
+    clear_chat_cancelled(&run_id).await;
 
     let tokens_per_second = match (eval_count, eval_duration) {
         (Some(count), Some(duration)) if duration > 0 => {
@@ -857,7 +977,7 @@ async fn chat_model(app: tauri::AppHandle, request: ChatRequest) -> Result<RunRe
 
     Ok(RunResult {
         model: request.model,
-        prompt: request.prompt,
+        prompt,
         response: response_text,
         thinking: thinking_text,
         total_duration,
@@ -947,6 +1067,7 @@ pub fn run() {
             unload_model,
             search_catalog,
             catalog_model_tags,
+            cancel_chat,
             chat_model,
             pull_model,
             install_ollama,

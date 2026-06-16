@@ -82,6 +82,15 @@ pre {
   z-index: 1;
 }
 
+.model-yard-background {
+  contain: strict;
+  transform: translateZ(0);
+}
+
+.model-yard-background img {
+  content-visibility: auto;
+}
+
 .model-yard-shell::before {
   content: none;
 }
